@@ -21,6 +21,7 @@ import { ThemeProvider, createTheme } from '@mui/material/styles';
 import PublicIcon from '@mui/icons-material/Public';
 import { useSampleStore } from '../../stores/sampleStore';
 import { useToastStore } from '../../stores/uiStore';
+import { useReloadOnFocus } from '../../hooks/useReloadOnFocus';
 
 const DRAWER_WIDTH = 232;
 
@@ -53,6 +54,8 @@ export default function AppShell({ children }: { children: ReactNode }) {
   const sampleCount = useSampleStore((s) => s.samples.length);
   const toast = useToastStore();
   const location = useLocation();
+
+  useReloadOnFocus();
 
   useEffect(() => {
     if (!loaded) void loadAll();

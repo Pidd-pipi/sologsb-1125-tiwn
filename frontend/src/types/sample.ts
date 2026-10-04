@@ -30,6 +30,8 @@ export interface MeteoriteSample {
   createdAt: number;
   /** v3 升级迁移新增字段 */
   updatedAt: number;
+  /** 修订号：每次写入自增 1，用于详情页乐观并发检查 */
+  revision: number;
 }
 
 export const CATEGORY_LABELS: Record<SampleCategory, string> = {

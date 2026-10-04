@@ -26,6 +26,8 @@ export interface AnalysisRecord {
   /** 检测日期 YYYY-MM-DD */
   testedAt: string;
   createdAt: number;
+  /** 修订号：每次写入自增 1，用于详情页乐观并发检查 */
+  revision: number;
 }
 
 export const ANALYSIS_METHOD_LABELS: Record<AnalysisMethod, string> = {
@@ -85,5 +87,6 @@ export function emptyAnalysisDraft(sampleId: string): Omit<AnalysisRecord, 'id' 
     ni: 0,
     kamaciteBandwidth: 0,
     testedAt: new Date().toISOString().slice(0, 10),
+    revision: 1,
   };
 }

@@ -1,9 +1,13 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Alert,
   Box,
   Button,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Divider,
   FormControl,
   Grid,
@@ -17,11 +21,14 @@ import {
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import ArrowBackIcon from '@mui/icons-material/ArrowBack';
+import EditIcon from '@mui/icons-material/Edit';
+import RefreshIcon from '@mui/icons-material/Refresh';
 import { Link as RouterLink, useParams } from 'react-router-dom';
 import SampleCard from '../components/common/SampleCard';
 import FieldGroup from '../components/common/FieldGroup';
 import ClassificationBadge from '../components/common/Badge';
 import EmptyState from '../components/common/EmptyState';
+import ConflictDialog from '../components/ConflictDialog';
 import { useSampleStore } from '../stores/sampleStore';
 import { useToastStore } from '../stores/uiStore';
 import {
@@ -44,13 +51,49 @@ import {
 } from '../types/section';
 import {
   FALL_OR_FIND_LABELS,
+  FALL_OR_FINDS,
   STORAGE_LABELS,
+  STORAGE_LOCATIONS,
   WEATHERING_LABELS,
+  WEATHERING_GRADES,
+  SAMPLE_CATEGORIES,
+  CHEMICAL_GROUPS,
+  CHEMICAL_GROUP_LABELS,
+  CATEGORY_LABELS,
+  type ChemicalGroup,
+  type FallOrFind,
+  type SampleCategory,
+  type StorageLocation,
+  type WeatheringGrade,
+  type MeteoriteSample,
 } from '../types/sample';
-import { FIND_ENVIRONMENT_LABELS, COORDINATE_SOURCE_LABELS } from '../types/find';
+import {
+  FIND_ENVIRONMENT_LABELS,
+  FIND_ENVIRONMENTS,
+  COORDINATE_SOURCE_LABELS,
+  COORDINATE_SOURCES,
+  type CoordinateSource,
+  type FindEnvironment,
+  type FindRecord,
+} from '../types/find';
 import { classifyByAnalysis, evaluateThresholds } from '../utils/classify';
 import { formatDate, formatNumber, formatWeight } from '../utils/format';
 import { formatCoordinate } from '../utils/geo';
+import {
+  aggregateStale,
+  snapshotOf,
+  type AggregateSnapshot,
+  type FieldConflict,
+} from '../utils/revision';
+
+/** 变化键 → 中文标签 */
+function changedKeyLabel(key: string): string {
+  if (key === 'sample') return '样本信息';
+  if (key === 'find') return '发现地';
+  if (key.startsWith('section:')) return '切片';
+  if (key.startsWith('analysis:')) return '检测记录';
+  return key;
+}
 
 /** `/samples/:id` 样本详情 */
 export default function Detail() {
@@ -62,12 +105,35 @@ export default function Detail() {
   const addSection = useSampleStore((s) => s.addSection);
   const addAnalysis = useSampleStore((s) => s.addAnalysis);
   const updateSample = useSampleStore((s) => s.updateSample);
+  const commitSampleEdit = useSampleStore((s) => s.commitSampleEdit);
+  const commitFindEdit = useSampleStore((s) => s.commitFindEdit);
+  const reloadAggregate = useSampleStore((s) => s.reloadAggregate);
   const notify = useToastStore((s) => s.notify);
 
   const sample = useMemo(() => samples.find((s) => s.id === id), [samples, id]);
   const find = useMemo(() => finds.find((f) => f.sampleId === id), [finds, id]);
   const mySections = useMemo(() => sections.filter((s) => s.sampleId === id), [sections, id]);
   const myAnalysis = useMemo(() => analysis.filter((a) => a.sampleId === id), [analysis, id]);
+
+  // 详情页打开时的修订号快照
+  const [snapshot, setSnapshot] = useState<AggregateSnapshot | null>(null);
+  // 是否落后于当前档案
+  const [stale, setStale] = useState(false);
+  const [changedKeys, setChangedKeys] = useState<string[]>([]);
+
+  // 样本编辑对话框
+  const [editOpen, setEditOpen] = useState(false);
+  const [editDraft, setEditDraft] = useState<Partial<MeteoriteSample>>({});
+
+  // 发现记录编辑对话框
+  const [findEditOpen, setFindEditOpen] = useState(false);
+  const [findDraft, setFindDraft] = useState<Partial<FindRecord>>({});
+
+  // 冲突裁定对话框
+  const [conflictOpen, setConflictOpen] = useState(false);
+  const [conflicts, setConflicts] = useState<FieldConflict[]>([]);
+  const [conflictBaseRevision, setConflictBaseRevision] = useState<number>(0);
+  const [conflictKind, setConflictKind] = useState<'sample' | 'find'>('sample');
 
   const [sectionDraft, setSectionDraft] = useState({
     sectionNo: '',
@@ -86,6 +152,29 @@ export default function Detail() {
     testedAt: new Date().toISOString().slice(0, 10),
   });
 
+  // 挂载或 id 变化时从 DB 重新读取聚合数据并建立修订号快照
+  useEffect(() => {
+    let cancelled = false;
+    reloadAggregate(id).then((agg) => {
+      if (cancelled || !agg) return;
+      setSnapshot(snapshotOf(agg));
+      setStale(false);
+      setChangedKeys([]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, reloadAggregate]);
+
+  // 当 store 数据变化（跨标签页重载或本页写入）时，检查快照是否落后
+  useEffect(() => {
+    if (!snapshot || !sample) return;
+    const current = snapshotOf({ sample, find, sections: mySections, analysis: myAnalysis });
+    const { stale: isStale, changedKeys: keys } = aggregateStale(current, snapshot);
+    setStale(isStale);
+    setChangedKeys(keys);
+  }, [sample, find, mySections, myAnalysis, snapshot]);
+
   if (!sample) {
     return (
       <Stack spacing={2}>
@@ -103,8 +192,166 @@ export default function Detail() {
   const advice = classifyByAnalysis(analysisDraft);
   const hits = evaluateThresholds(analysisDraft);
 
+  const uniqueChangedLabels = Array.from(new Set(changedKeys.map(changedKeyLabel)));
+
+  const handleRefresh = async () => {
+    const agg = await reloadAggregate(id);
+    if (agg) {
+      setSnapshot(snapshotOf(agg));
+      setStale(false);
+      setChangedKeys([]);
+      notify('已刷新为最新档案');
+    }
+  };
+
+  // ── 样本编辑 ──────────────────────────────────────────────
+  const openEdit = () => {
+    setEditDraft({
+      sampleNo: sample.sampleNo,
+      totalWeight: sample.totalWeight,
+      category: sample.category,
+      chemicalGroup: sample.chemicalGroup,
+      weathering: sample.weathering,
+      fallOrFind: sample.fallOrFind,
+      storage: sample.storage,
+      note: sample.note ?? '',
+    });
+    setEditOpen(true);
+  };
+
+  const submitEdit = async () => {
+    if (!snapshot) return;
+    const patch: Partial<MeteoriteSample> = {
+      ...editDraft,
+      note: editDraft.note?.trim() || undefined,
+    };
+    const result = await commitSampleEdit(sample.id, snapshot.sampleRevision, patch);
+    if (result.ok) {
+      setSnapshot((prev) =>
+        prev ? { ...prev, sampleRevision: prev.sampleRevision + 1 } : prev,
+      );
+      setEditOpen(false);
+      notify('样本档案已更新');
+    } else if (result.deleted) {
+      notify('该样本已被删除', 'warning');
+      setEditOpen(false);
+    } else if (result.conflicts && result.current) {
+      setConflicts(result.conflicts);
+      setConflictBaseRevision((result.current as MeteoriteSample).revision);
+      setConflictKind('sample');
+      setConflictOpen(true);
+    }
+  };
+
+  const resolveSampleConflict = async (resolved: Record<string, unknown>) => {
+    const result = await commitSampleEdit(
+      sample.id,
+      conflictBaseRevision,
+      resolved as Partial<MeteoriteSample>,
+    );
+    if (result.ok) {
+      setSnapshot((prev) =>
+        prev ? { ...prev, sampleRevision: conflictBaseRevision + 1 } : prev,
+      );
+      setConflictOpen(false);
+      setEditOpen(false);
+      notify('样本档案已更新');
+    } else if (result.deleted) {
+      notify('该样本已被删除', 'warning');
+      setConflictOpen(false);
+      setEditOpen(false);
+    } else if (result.conflicts && result.current) {
+      setConflicts(result.conflicts);
+      setConflictBaseRevision((result.current as MeteoriteSample).revision);
+    }
+  };
+
+  // ── 发现记录编辑 ──────────────────────────────────────────
+  const openFindEdit = () => {
+    if (find) {
+      setFindDraft({
+        placeName: find.placeName,
+        region: find.region,
+        longitude: find.longitude,
+        latitude: find.latitude,
+        coordinateSource: find.coordinateSource,
+        environment: find.environment,
+        finder: find.finder,
+      });
+    } else {
+      setFindDraft({
+        placeName: '',
+        region: '',
+        longitude: 0,
+        latitude: 0,
+        coordinateSource: 'gps',
+        environment: 'desert',
+        finder: '',
+      });
+    }
+    setFindEditOpen(true);
+  };
+
+  const submitFindEdit = async () => {
+    if (!snapshot) return;
+    const patch: Partial<FindRecord> = {
+      ...findDraft,
+      finder: findDraft.finder?.trim() || '未署名',
+    };
+    const result = await commitFindEdit(
+      sample.id,
+      find ? snapshot.findRevision ?? 0 : null,
+      patch,
+      !find,
+    );
+    if (result.ok) {
+      setSnapshot((prev) =>
+        prev
+          ? { ...prev, findRevision: find ? (prev.findRevision ?? 0) + 1 : 1 }
+          : prev,
+      );
+      setFindEditOpen(false);
+      notify(find ? '发现记录已更新' : '已补录发现地');
+    } else if (result.deleted) {
+      notify('该样本已被删除', 'warning');
+      setFindEditOpen(false);
+    } else if (result.conflicts && result.current) {
+      setConflicts(result.conflicts);
+      setConflictBaseRevision((result.current as FindRecord).revision);
+      setConflictKind('find');
+      setConflictOpen(true);
+    }
+  };
+
+  const resolveFindConflict = async (resolved: Record<string, unknown>) => {
+    const result = await commitFindEdit(
+      sample.id,
+      conflictBaseRevision,
+      resolved as Partial<FindRecord>,
+      false,
+    );
+    if (result.ok) {
+      setSnapshot((prev) =>
+        prev ? { ...prev, findRevision: conflictBaseRevision + 1 } : prev,
+      );
+      setConflictOpen(false);
+      setFindEditOpen(false);
+      notify('发现记录已更新');
+    } else if (result.deleted) {
+      notify('该样本已被删除', 'warning');
+      setConflictOpen(false);
+      setFindEditOpen(false);
+    } else if (result.conflicts && result.current) {
+      setConflicts(result.conflicts);
+      setConflictBaseRevision((result.current as FindRecord).revision);
+    }
+  };
+
+  // ── 切片与检测记录新增 ────────────────────────────────────
   const submitSection = async () => {
-    const no = sectionDraft.sectionNo.trim() || `TS-${new Date().getFullYear()}-${mySections.length + 1}`.padEnd(3, '0');
+    const no =
+      sectionDraft.sectionNo.trim() ||
+      `TS-${new Date().getFullYear()}-${mySections.length + 1}`.padEnd(3, '0');
     await addSection({
       sectionNo: no,
       sampleId: sample.id,
@@ -132,6 +379,16 @@ export default function Detail() {
     notify(`已为 ${sample.sampleNo} 写入一条检测记录`);
   };
 
+  const toggleStorage = () => {
+    void updateSample(sample.id, {
+      storage: sample.storage === 'loan-out' ? 'cabinet-a' : 'loan-out',
+    });
+    setSnapshot((prev) =>
+      prev ? { ...prev, sampleRevision: prev.sampleRevision + 1 } : prev,
+    );
+    notify('已切换存放状态');
+  };
+
   return (
     <Stack spacing={2.5}>
       <Stack direction="row" spacing={1.5} alignItems="center">
@@ -140,6 +397,20 @@ export default function Detail() {
         </Button>
         <Typography variant="h4">样本详情</Typography>
       </Stack>
+
+      {stale ? (
+        <Alert
+          severity="warning"
+          action={
+            <Button color="inherit" size="small" startIcon={<RefreshIcon />} onClick={handleRefresh}>
+              刷新为最新档案
+            </Button>
+          }
+        >
+          档案已被其他标签页更新（{uniqueChangedLabels.join('、')}），当前显示的是较早的修订版本。
+          刷新后再编辑可避免覆盖他人修改。
+        </Alert>
+      ) : null}
 
       <Grid container spacing={2.5}>
         <Grid item xs={12} md={4}>
@@ -156,16 +427,14 @@ export default function Detail() {
             <Stack spacing={1.5}>
               <Stack direction="row" justifyContent="space-between" alignItems="center">
                 <Typography variant="h6">基本信息</Typography>
-                <Button
-                  size="small"
-                  variant="outlined"
-                  onClick={() => {
-                    void updateSample(sample.id, { storage: sample.storage === 'loan-out' ? 'cabinet-a' : 'loan-out' });
-                    notify('已切换存放状态');
-                  }}
-                >
-                  切换存放状态
-                </Button>
+                <Stack direction="row" spacing={1}>
+                  <Button size="small" variant="outlined" startIcon={<EditIcon />} onClick={openEdit}>
+                    编辑档案
+                  </Button>
+                  <Button size="small" variant="outlined" onClick={toggleStorage}>
+                    切换存放状态
+                  </Button>
+                </Stack>
               </Stack>
               <ClassificationBadge
                 category={sample.category}
@@ -211,6 +480,12 @@ export default function Detail() {
                     {formatDate(sample.createdAt)} / {formatDate(sample.updatedAt)}
                   </Typography>
                 </Grid>
+                <Grid item xs={6} sm={4}>
+                  <Typography variant="caption" color="text.secondary">
+                    修订号
+                  </Typography>
+                  <Typography variant="body1">第 {sample.revision} 版</Typography>
+                </Grid>
               </Grid>
               {sample.note ? (
                 <Typography variant="body2" color="text.secondary">
@@ -218,7 +493,12 @@ export default function Detail() {
                 </Typography>
               ) : null}
               <Divider />
-              <Typography variant="h6">发现地摘要</Typography>
+              <Stack direction="row" justifyContent="space-between" alignItems="center">
+                <Typography variant="h6">发现地摘要</Typography>
+                <Button size="small" variant="outlined" startIcon={<EditIcon />} onClick={openFindEdit}>
+                  {find ? '编辑发现地' : '补录发现地'}
+                </Button>
+              </Stack>
               {find ? (
                 <Grid container spacing={1.5}>
                   <Grid item xs={6} sm={4}>
@@ -266,7 +546,7 @@ export default function Detail() {
                 </Grid>
               ) : (
                 <Alert severity="warning">
-                  该样本尚未登记发现地坐标，可返回 <RouterLink to="/samples/new">样本登记</RouterLink> 补录。
+                  该样本尚未登记发现地坐标，可点击右上角「补录发现地」就地登记。
                 </Alert>
               )}
             </Stack>
@@ -546,6 +826,187 @@ export default function Detail() {
           </Paper>
         </Grid>
       </Grid>
+
+      {/* 样本编辑对话框 */}
+      <Dialog open={editOpen} onClose={() => setEditOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>编辑样本档案</DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.5} sx={{ mt: 0.5 }}>
+            <TextField
+              size="small"
+              label="样本编号"
+              value={editDraft.sampleNo ?? ''}
+              onChange={(e) => setEditDraft((d) => ({ ...d, sampleNo: e.target.value }))}
+            />
+            <FieldGroup title="总重量" unit="g" min={0.1} max={200000} value={editDraft.totalWeight ?? 0}
+              onChange={(v) => setEditDraft((d) => ({ ...d, totalWeight: v }))} inputId="edit-total-weight" label="总重量" />
+            <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap>
+              <FormControl size="small" sx={{ minWidth: 160 }}>
+                <InputLabel id="edit-category-label">分类</InputLabel>
+                <Select
+                  labelId="edit-category-label"
+                  label="分类"
+                  value={editDraft.category ?? 'chondrite'}
+                  onChange={(e) => setEditDraft((d) => ({ ...d, category: e.target.value as SampleCategory }))}
+                >
+                  {SAMPLE_CATEGORIES.map((c) => (
+                    <MenuItem key={c} value={c}>{CATEGORY_LABELS[c]}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 160 }}>
+                <InputLabel id="edit-group-label">化学群</InputLabel>
+                <Select
+                  labelId="edit-group-label"
+                  label="化学群"
+                  value={editDraft.chemicalGroup ?? 'ungrouped'}
+                  onChange={(e) => setEditDraft((d) => ({ ...d, chemicalGroup: e.target.value as ChemicalGroup }))}
+                >
+                  {CHEMICAL_GROUPS.map((g) => (
+                    <MenuItem key={g} value={g}>{CHEMICAL_GROUP_LABELS[g]}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 140 }}>
+                <InputLabel id="edit-weathering-label">风化等级</InputLabel>
+                <Select
+                  labelId="edit-weathering-label"
+                  label="风化等级"
+                  value={editDraft.weathering ?? 'W1'}
+                  onChange={(e) => setEditDraft((d) => ({ ...d, weathering: e.target.value as WeatheringGrade }))}
+                >
+                  {WEATHERING_GRADES.map((w) => (
+                    <MenuItem key={w} value={w}>{WEATHERING_LABELS[w]}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 130 }}>
+                <InputLabel id="edit-fallfind-label">发现/坠落</InputLabel>
+                <Select
+                  labelId="edit-fallfind-label"
+                  label="发现/坠落"
+                  value={editDraft.fallOrFind ?? 'find'}
+                  onChange={(e) => setEditDraft((d) => ({ ...d, fallOrFind: e.target.value as FallOrFind }))}
+                >
+                  {FALL_OR_FINDS.map((f) => (
+                    <MenuItem key={f} value={f}>{FALL_OR_FIND_LABELS[f]}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 160 }}>
+                <InputLabel id="edit-storage-label">存放位置</InputLabel>
+                <Select
+                  labelId="edit-storage-label"
+                  label="存放位置"
+                  value={editDraft.storage ?? 'cabinet-a'}
+                  onChange={(e) => setEditDraft((d) => ({ ...d, storage: e.target.value as StorageLocation }))}
+                >
+                  {STORAGE_LOCATIONS.map((s) => (
+                    <MenuItem key={s} value={s}>{STORAGE_LABELS[s]}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Stack>
+            <TextField
+              size="small"
+              label="备注"
+              value={editDraft.note ?? ''}
+              onChange={(e) => setEditDraft((d) => ({ ...d, note: e.target.value }))}
+              multiline
+              minRows={2}
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setEditOpen(false)}>取消</Button>
+          <Button variant="contained" onClick={submitEdit}>保存修改</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 发现记录编辑对话框 */}
+      <Dialog open={findEditOpen} onClose={() => setFindEditOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{find ? '编辑发现地' : '补录发现地'}</DialogTitle>
+        <DialogContent>
+          <Stack spacing={1.5} sx={{ mt: 0.5 }}>
+            <TextField
+              size="small"
+              label="发现地名"
+              value={findDraft.placeName ?? ''}
+              onChange={(e) => setFindDraft((d) => ({ ...d, placeName: e.target.value }))}
+            />
+            <TextField
+              size="small"
+              label="国家 / 地区"
+              value={findDraft.region ?? ''}
+              onChange={(e) => setFindDraft((d) => ({ ...d, region: e.target.value }))}
+            />
+            <Stack direction="row" spacing={1.5}>
+              <TextField
+                size="small"
+                type="number"
+                label="经度"
+                value={findDraft.longitude ?? 0}
+                onChange={(e) => setFindDraft((d) => ({ ...d, longitude: Number(e.target.value) }))}
+                sx={{ width: 150 }}
+              />
+              <TextField
+                size="small"
+                type="number"
+                label="纬度"
+                value={findDraft.latitude ?? 0}
+                onChange={(e) => setFindDraft((d) => ({ ...d, latitude: Number(e.target.value) }))}
+                sx={{ width: 150 }}
+              />
+            </Stack>
+            <Stack direction="row" spacing={1.5}>
+              <FormControl size="small" sx={{ minWidth: 150 }}>
+                <InputLabel id="find-coord-src-label">坐标来源</InputLabel>
+                <Select
+                  labelId="find-coord-src-label"
+                  label="坐标来源"
+                  value={findDraft.coordinateSource ?? 'gps'}
+                  onChange={(e) => setFindDraft((d) => ({ ...d, coordinateSource: e.target.value as CoordinateSource }))}
+                >
+                  {COORDINATE_SOURCES.map((c) => (
+                    <MenuItem key={c} value={c}>{COORDINATE_SOURCE_LABELS[c]}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl size="small" sx={{ minWidth: 150 }}>
+                <InputLabel id="find-env-label">发现环境</InputLabel>
+                <Select
+                  labelId="find-env-label"
+                  label="发现环境"
+                  value={findDraft.environment ?? 'desert'}
+                  onChange={(e) => setFindDraft((d) => ({ ...d, environment: e.target.value as FindEnvironment }))}
+                >
+                  {FIND_ENVIRONMENTS.map((f) => (
+                    <MenuItem key={f} value={f}>{FIND_ENVIRONMENT_LABELS[f]}</MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Stack>
+            <TextField
+              size="small"
+              label="发现者"
+              value={findDraft.finder ?? ''}
+              onChange={(e) => setFindDraft((d) => ({ ...d, finder: e.target.value }))}
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setFindEditOpen(false)}>取消</Button>
+          <Button variant="contained" onClick={submitFindEdit}>保存</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 字段冲突裁定对话框 */}
+      <ConflictDialog
+        open={conflictOpen}
+        conflicts={conflicts}
+        onClose={() => setConflictOpen(false)}
+        onResolve={conflictKind === 'sample' ? resolveSampleConflict : resolveFindConflict}
+      />
     </Stack>
   );
 }
