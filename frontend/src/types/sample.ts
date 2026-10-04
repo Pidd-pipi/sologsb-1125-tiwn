@@ -30,6 +30,11 @@ export interface MeteoriteSample {
   createdAt: number;
   /** v3 升级迁移新增字段 */
   updatedAt: number;
+  /**
+   * 聚合修订号（乐观锁）：v4 升级回填为初版 1。
+   * 同一档案簇（样本 + 发现 + 切片 + 检测）任一部分被写入新版本，样本修订号 +1。
+   */
+  revision: number;
 }
 
 export const CATEGORY_LABELS: Record<SampleCategory, string> = {

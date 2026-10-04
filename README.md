@@ -42,7 +42,7 @@ docker compose down
 | --- | --- | --- |
 | `/` | 样本总览：卡片流 + 分类/化学群/重量区间筛选与排序，缺坐标或缺切片显示角标 | MeteoriteSample |
 | `/samples/new` | 样本登记：编号生成、分类化学群、重量、存放位置，可补录发现地坐标并即时校验 | MeteoriteSample、FindRecord |
-| `/samples/:id` | 样本详情：基本信息 + 发现地摘要 + 切片列表 + 分析记录，可就地新增 | 四个模型 |
+| `/samples/:id` | 样本详情：基本信息与发现地就地编辑 + 切片列表 + 分析记录；按聚合修订号做乐观锁与字段冲突裁定 | 四个模型 |
 | `/sections` | 切片库：按厚度与矿物占比筛选，回跳样本，批量标注质量 | ThinSection、MeteoriteSample |
 | `/analysis` | 分析检测：录入 Fa / Fs / Ni / 铁纹石带宽，实时分类建议与阈值命中说明 | AnalysisRecord、MeteoriteSample |
 | `/locations` | 发现地分布：SVG 网格按经纬度打点、按分类着色、点选弹出样本清单 | FindRecord、MeteoriteSample |
@@ -53,6 +53,7 @@ docker compose down
 - `types/find.ts` — **FindRecord**：id、关联样本、地名、国家地区、经纬度、坐标来源（GPS/文献）、发现环境、发现者
 - `types/section.ts` — **ThinSection**：id、切片编号、关联样本、厚度 μm、制样方式、矿物占比、显微照片清单
 - `types/analysis.ts` — **AnalysisRecord**：id、关联样本或切片、方法、橄榄石 Fa、辉石 Fs、Ni wt%、铁纹石带宽 mm、检测日期
+- 四张表自 v4 起都带 **`revision` 聚合修订号**（初版为 1），详见下方「并发编辑与修订号」
 
 ## 目录结构
 
@@ -73,11 +74,11 @@ sologsb-1125/
         ├── types/{sample,find,section,analysis}.ts
         ├── db/index.ts                 # Dexie 封装与 v1→v3 升级迁移
         ├── stores/{sampleStore,uiStore}.ts
-        ├── components/common/{SampleCard,Badge,FieldGroup,EmptyState,CoordinatePicker,AppShell}.tsx
-        ├── hooks/{useSampleFilter,useLocalDraft,useRegionStats}.ts
+        ├── components/common/{SampleCard,Badge,FieldGroup,EmptyState,CoordinatePicker,AppShell,ConflictResolutionDialog}.tsx
+        ├── hooks/{useSampleFilter,useSampleBundles,useLocalDraft,useRegionStats}.ts
         ├── pages/{Overview,New,Detail,Sections,Analysis,Locations}.tsx
         ├── router/index.tsx
-        └── utils/{classify,format,geo}.ts
+        └── utils/{classify,format,geo,revision}.ts
 ```
 
 ## 数据存储说明
@@ -87,6 +88,17 @@ sologsb-1125/
   - v1 建 `samples` / `finds` / `sections`
   - v2 新增 `analysis` 表并加 `sampleId` 索引
   - v3 为 `samples` 补 `updatedAt` 字段并按 id 回填旧记录
+  - v4 四张表补 `revision` 聚合修订号（乐观锁），旧数据一律回填初版修订号 `1`
+
+## 并发编辑与修订号（乐观锁 + 字段级三方合并）
+
+两个人同时打开同一样本（例如两个浏览器标签页）：一方整理分类 / 风化 / 存放位置，另一方补发现地 / 切片 / 检测数值。
+
+- **按修订号一起检查四表**：详情保存时在一个 Dexie 事务内重读样本、发现记录、切片、检测记录（`sampleStore.saveBundleRevision`），把编辑基线 `BundleRevisions` 与库内当前版本逐表比对；任一部分修订号不同即判定版本落后
+- **先列字段冲突，保留本次输入**：落后时不写入，按「base / 本次输入 / 对方新版本」做三方比对（`utils/revision.ts`），双方都改且取值不同的字段进入冲突清单（默认保留本次输入），仅对方修改的字段自动合并；由 `ConflictResolutionDialog` 逐项裁定
+- **裁定完成才写入新版本**：携带裁定结果再次提交，事务内复查修订号（防止裁定期间又有更新），随后把样本、发现、切片、检测各自的修订号推进，样本簇修订号统一 +1
+- **同一版本聚合**：详情、发现地分布（`useRegionStats`）与总览筛选（`useSampleFilter`）都消费同一份版本化档案簇聚合 `useSampleBundles`；任何写入后四张表原子刷新，聚合随之重算，不会继续显示旧汇总
+- **跨标签页联动**：写入方通过 `BroadcastChannel('gbmeteorite-revision')` 通知其他标签页立即重读，切回标签页时再兜底重算一次；编辑期间检测到版本前进会显示提示条，且不抹掉本次输入
 - **草稿**：`/samples/new` 与 `/analysis` 的表单草稿写入 localStorage（键前缀 `gbmeteorite:draft:`），切页自动恢复，提交后清理
 - 首次打开会灌入 3 份演示样本、2 条发现记录、2 张切片与 2 条检测记录，便于直接体验筛选与打点
 

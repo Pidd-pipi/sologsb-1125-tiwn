@@ -15,7 +15,7 @@ import { Link as RouterLink } from 'react-router-dom';
 import EmptyState from '../components/common/EmptyState';
 import ClassificationBadge from '../components/common/Badge';
 import { useRegionStats } from '../hooks/useRegionStats';
-import { useSampleStore } from '../stores/sampleStore';
+import { useSampleBundles } from '../hooks/useSampleBundles';
 import { CATEGORY_LABELS, type SampleCategory } from '../types/sample';
 import { categoryColor, formatWeight } from '../utils/format';
 import { FIND_ENVIRONMENT_LABELS } from '../types/find';
@@ -27,21 +27,26 @@ const GRID = graticuleLines(SIZE, 30);
 /** `/locations` 发现地分布（SVG 网格打点，无外部地图依赖） */
 export default function Locations() {
   const { stats, totalSamples, totalWeight } = useRegionStats();
-  const finds = useSampleStore((s) => s.finds);
-  const samples = useSampleStore((s) => s.samples);
+  const { bundles } = useSampleBundles();
   const [activeRegion, setActiveRegion] = useState<string | null>(null);
   const [activePoint, setActivePoint] = useState<string | null>(null);
 
-  const sampleMap = useMemo(() => new Map(samples.map((s) => [s.id, s])), [samples]);
+  /** 带关联样本的发现点（来自版本化档案簇聚合） */
+  const findPoints = useMemo(
+    () =>
+      bundles
+        .filter((b) => b.find)
+        .map((b) => ({ find: b.find!, sample: b.sample })),
+    [bundles],
+  );
 
   const points = useMemo(() => {
-    const list = finds.filter((f) => (activeRegion ? f.region === activeRegion : true));
-    return list.map((f) => {
-      const sample = sampleMap.get(f.sampleId);
-      const pos = projectToGrid({ longitude: f.longitude, latitude: f.latitude }, SIZE);
-      return { find: f, sample, pos };
+    const list = findPoints.filter((p) => (activeRegion ? p.find.region === activeRegion : true));
+    return list.map((p) => {
+      const pos = projectToGrid({ longitude: p.find.longitude, latitude: p.find.latitude }, SIZE);
+      return { find: p.find, sample: p.sample, pos };
     });
-  }, [finds, sampleMap, activeRegion]);
+  }, [findPoints, activeRegion]);
 
   const activeFind = points.find((p) => p.find.id === activePoint);
 
@@ -60,7 +65,7 @@ export default function Locations() {
         </Typography>
       </Box>
 
-      {finds.length === 0 ? (
+      {findPoints.length === 0 ? (
         <EmptyState
           title="还没有登记任何发现地坐标"
           description="在样本登记页补录发现地名、经纬度与坐标来源后，这里会自动打点。"

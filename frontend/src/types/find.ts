@@ -22,6 +22,8 @@ export interface FindRecord {
   /** 发现者 */
   finder: string;
   createdAt: number;
+  /** 聚合修订号（乐观锁）：v4 升级回填为初版 1 */
+  revision: number;
 }
 
 export const COORDINATE_SOURCE_LABELS: Record<CoordinateSource, string> = {

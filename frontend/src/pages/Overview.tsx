@@ -1,4 +1,3 @@
-import { useMemo } from 'react';
 import {
   Box,
   Button,
@@ -17,7 +16,7 @@ import { Link as RouterLink } from 'react-router-dom';
 import SampleCard from '../components/common/SampleCard';
 import EmptyState from '../components/common/EmptyState';
 import { useSampleFilter } from '../hooks/useSampleFilter';
-import { useSampleStore } from '../stores/sampleStore';
+import { useSampleBundles } from '../hooks/useSampleBundles';
 import { useUiStore } from '../stores/uiStore';
 import {
   CATEGORY_LABELS,
@@ -30,24 +29,11 @@ import { formatWeight } from '../utils/format';
 /** `/` 样本总览 */
 export default function Overview() {
   const { results, total, activeCount } = useSampleFilter();
-  const samples = useSampleStore((s) => s.samples);
-  const finds = useSampleStore((s) => s.finds);
-  const sections = useSampleStore((s) => s.sections);
-  const analysis = useSampleStore((s) => s.analysis);
+  const { bundleBySampleId, bundles } = useSampleBundles();
 
   const ui = useUiStore();
 
-  const findBySample = useMemo(() => new Map(finds.map((f) => [f.sampleId, f])), [finds]);
-  const sectionCount = useMemo(() => {
-    const m = new Map<string, number>();
-    sections.forEach((s) => m.set(s.sampleId, (m.get(s.sampleId) ?? 0) + 1));
-    return m;
-  }, [sections]);
-  const analysisCount = useMemo(() => {
-    const m = new Map<string, number>();
-    analysis.forEach((a) => m.set(a.sampleId, (m.get(a.sampleId) ?? 0) + 1));
-    return m;
-  }, [analysis]);
+  const hasAnySample = bundles.length > 0;
 
   const totalWeight = results.reduce((n, s) => n + s.totalWeight, 0);
 
@@ -175,28 +161,31 @@ export default function Overview() {
 
       {results.length === 0 ? (
         <EmptyState
-          title={samples.length === 0 ? '还没有任何样本档案' : '没有符合筛选条件的样本'}
+          title={!hasAnySample ? '还没有任何样本档案' : '没有符合筛选条件的样本'}
           description={
-            samples.length === 0
+            !hasAnySample
               ? '先登记一份陨石样本，再补录发现地坐标与切片制样信息。'
               : '试着放宽分类、化学群或重量区间条件。'
           }
-          actionLabel={samples.length === 0 ? '登记第一份样本' : '清空筛选条件'}
-          actionTo={samples.length === 0 ? '/samples/new' : undefined}
-          onAction={samples.length === 0 ? undefined : ui.reset}
+          actionLabel={!hasAnySample ? '登记第一份样本' : '清空筛选条件'}
+          actionTo={!hasAnySample ? '/samples/new' : undefined}
+          onAction={!hasAnySample ? undefined : ui.reset}
         />
       ) : (
         <Grid container spacing={2}>
-          {results.map((s) => (
-            <Grid item xs={12} sm={6} md={4} lg={3} key={s.id}>
-              <SampleCard
-                sample={s}
-                find={findBySample.get(s.id)}
-                sectionCount={sectionCount.get(s.id) ?? 0}
-                analysisCount={analysisCount.get(s.id) ?? 0}
-              />
-            </Grid>
-          ))}
+          {results.map((s) => {
+            const b = bundleBySampleId.get(s.id);
+            return (
+              <Grid item xs={12} sm={6} md={4} lg={3} key={s.id}>
+                <SampleCard
+                  sample={s}
+                  find={b?.find}
+                  sectionCount={b?.sections.length ?? 0}
+                  analysisCount={b?.analysis.length ?? 0}
+                />
+              </Grid>
+            );
+          })}
         </Grid>
       )}
     </Stack>
